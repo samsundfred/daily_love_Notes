@@ -3,91 +3,20 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:http/http.dart' as http;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:timezone/data/latest_all.dart' as tz;
+import 'package:http/http.dart' as http;
 import 'package:timezone/timezone.dart' as tz;
+import 'package:timezone/data/latest.dart' as tz;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   tz.initializeTimeZones();
-  tz.setLocalLocation(tz.local);
-  await NotificationService.initialize();
+  await NotificationService().init();
   runApp(const LoveApp());
 }
 
-class NotificationService {
-  static final FlutterLocalNotificationsPlugin _notifications =
-  FlutterLocalNotificationsPlugin();
-
-  static Future<void> initialize() async {
-    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
-    const initSettings = InitializationSettings(android: androidInit);
-
-    await _notifications.initialize(initSettings);
-
-    // 🔔 Request permission for Android 13+
-    await _notifications
-        .resolvePlatformSpecificImplementation<
-        AndroidFlutterLocalNotificationsPlugin>()
-        ?.requestNotificationsPermission();
-  }
-
-  static Future<void> scheduleDailyNotifications(List<String> messages) async {
-    await _notifications.cancelAll();
-
-    final prefs = await SharedPreferences.getInstance();
-
-    List<String> remaining =
-        prefs.getStringList('remaining_rotation') ?? List.from(messages);
-
-    if (remaining.isEmpty) {
-      remaining = List.from(messages);
-    }
-
-    remaining.shuffle();
-
-    final morningMessage = remaining.removeLast();
-    final nightMessage =
-    remaining.isNotEmpty ? remaining.removeLast() : morningMessage;
-
-    await prefs.setStringList('remaining_rotation', remaining);
-
-    await _scheduleAt(9, 0, morningMessage, 0);
-    await _scheduleAt(21, 0, nightMessage, 1);
-  }
-
-  static Future<void> _scheduleAt(
-      int hour, int minute, String message, int id) async {
-    final now = tz.TZDateTime.now(tz.local);
-    var scheduled =
-    tz.TZDateTime(tz.local, now.year, now.month, now.day, hour, minute);
-
-    if (scheduled.isBefore(now)) {
-      scheduled = scheduled.add(const Duration(days: 1));
-    }
-
-    const androidDetails = AndroidNotificationDetails(
-      'daily_love_channel',
-      'Daily Love Notes',
-      channelDescription: 'Daily love quotes',
-      importance: Importance.high,
-      priority: Priority.high,
-      icon: '@mipmap/ic_launcher',
-    );
-
-    await _notifications.zonedSchedule(
-      id,
-      'Daily Love Note ❤️',
-      message,
-      scheduled,
-      const NotificationDetails(android: androidDetails),
-      androidAllowWhileIdle: true,
-      uiLocalNotificationDateInterpretation:
-      UILocalNotificationDateInterpretation.absoluteTime,
-    );
-  }
-}
+const githubUrl =
+    "https://raw.githubusercontent.com/samsundfred/daily_love_Notes/main/messages.json";
 
 class LoveApp extends StatelessWidget {
   const LoveApp({super.key});
@@ -109,12 +38,13 @@ class LoveApp extends StatelessWidget {
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
+
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  final List<String> bakedInMessages = [
+  List<String> messages = [
     "I love the way your mind works.",
     "You make my life softer just by being in it.",
     "You don’t have to be perfect to be incredible.",
@@ -127,46 +57,53 @@ class _HomeScreenState extends State<HomeScreen> {
     "You are deeply appreciated."
   ];
 
-  List<String> messages = [];
-  List<String> favorites = [];
   String currentMessage = "";
-  bool loading = true;
-
-  final githubUrl =
-      'https://raw.githubusercontent.com/samsundfred/daily_love_Notes/main/messages.json';
+  bool loading = false;
 
   @override
   void initState() {
     super.initState();
-    _initialize();
+    _loadLocalMessages().then((_) => _generateMessage());
+    NotificationService().scheduleDailyNotification(messages);
   }
 
-  Future<void> _initialize() async {
+  Future<void> _loadLocalMessages() async {
     final prefs = await SharedPreferences.getInstance();
-
-    favorites = prefs.getStringList('favorites') ?? [];
-    messages = prefs.getStringList('messages') ?? [];
-
-    if (messages.isEmpty) {
-      messages = List.from(bakedInMessages);
-      await prefs.setStringList('messages', messages);
+    final stored = prefs.getStringList('messages');
+    if (stored != null && stored.isNotEmpty) {
+      messages = stored;
     }
-
-    _generateMessage();
-    setState(() => loading = false);
-
-    Future.delayed(const Duration(milliseconds: 500), () async {
-      try {
-        await NotificationService.scheduleDailyNotifications(messages);
-      } catch (_) {}
-    });
   }
 
   void _generateMessage() {
     final random = Random();
     setState(() {
-      currentMessage = messages[random.nextInt(messages.length)];
+      if (messages.isNotEmpty) {
+        currentMessage = messages[random.nextInt(messages.length)];
+      } else {
+        currentMessage = "I love you ❤️";
+      }
     });
+  }
+
+  Future<void> _saveFavorite() async {
+    final prefs = await SharedPreferences.getInstance();
+    List<String> favorites = prefs.getStringList('favorites') ?? [];
+    if (!favorites.contains(currentMessage)) {
+      favorites.add(currentMessage);
+      await prefs.setStringList('favorites', favorites);
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Saved to favorites ❤️")),
+      );
+    }
+  }
+
+  void _openFavorites() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const FavoritesScreen()),
+    );
   }
 
   Future<void> _updateMessages() async {
@@ -179,12 +116,21 @@ class _HomeScreenState extends State<HomeScreen> {
           .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
-        final List<dynamic> online = jsonDecode(response.body);
-        int added = 0;
+        final decoded = jsonDecode(response.body);
+        List<String> onlineMessages = [];
+        if (decoded is List) {
+          onlineMessages = decoded.map((e) => e.toString()).toList();
+        }
 
-        for (var msg in online) {
-          if (!messages.contains(msg.toString())) {
-            messages.add(msg.toString());
+        int added = 0;
+        List<String> normalizedLocal =
+        messages.map((m) => m.trim()).toList();
+
+        for (var msg in onlineMessages) {
+          String nMsg = msg.trim();
+          if (!normalizedLocal.contains(nMsg)) {
+            messages.add(msg);
+            normalizedLocal.add(nMsg);
             added++;
           }
         }
@@ -211,31 +157,6 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => loading = false);
   }
 
-  Future<void> _toggleFavorite(String message) async {
-    final prefs = await SharedPreferences.getInstance();
-
-    if (favorites.contains(message)) {
-      favorites.remove(message);
-    } else {
-      favorites.add(message);
-    }
-
-    await prefs.setStringList('favorites', favorites);
-    setState(() {});
-  }
-
-  void _openFavorites() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => FavoritesScreen(
-          favorites: favorites,
-          onToggle: _toggleFavorite,
-        ),
-      ),
-    ).then((_) => setState(() {}));
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -245,17 +166,13 @@ class _HomeScreenState extends State<HomeScreen> {
           IconButton(
             icon: const Icon(Icons.favorite),
             onPressed: _openFavorites,
-          ),
-          IconButton(
-            icon: const Icon(Icons.system_update),
-            onPressed: _updateMessages,
-          ),
+          )
         ],
       ),
-      body: loading
-          ? const Center(child: CircularProgressIndicator())
-          : Center(
-        child: Padding(
+      body: Center(
+        child: loading
+            ? const CircularProgressIndicator()
+            : Padding(
           padding: const EdgeInsets.all(24),
           child: AnimatedSwitcher(
             duration: const Duration(milliseconds: 400),
@@ -287,13 +204,15 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           const SizedBox(height: 16),
           FloatingActionButton(
-            heroTag: "fav",
-            onPressed: () => _toggleFavorite(currentMessage),
-            child: Icon(
-              favorites.contains(currentMessage)
-                  ? Icons.favorite
-                  : Icons.favorite_border,
-            ),
+            heroTag: "save",
+            onPressed: _saveFavorite,
+            child: const Icon(Icons.bookmark),
+          ),
+          const SizedBox(height: 16),
+          FloatingActionButton(
+            heroTag: "update",
+            onPressed: _updateMessages,
+            child: const Icon(Icons.cloud_download),
           ),
         ],
       ),
@@ -302,43 +221,110 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 class FavoritesScreen extends StatefulWidget {
-  final List<String> favorites;
-  final Function(String) onToggle;
-
-  const FavoritesScreen({
-    super.key,
-    required this.favorites,
-    required this.onToggle,
-  });
+  const FavoritesScreen({super.key});
 
   @override
   State<FavoritesScreen> createState() => _FavoritesScreenState();
 }
 
 class _FavoritesScreenState extends State<FavoritesScreen> {
+  List<String> favorites = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadFavorites();
+  }
+
+  Future<void> _loadFavorites() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      favorites = prefs.getStringList('favorites') ?? [];
+    });
+  }
+
+  Future<void> _removeFavorite(String message) async {
+    final prefs = await SharedPreferences.getInstance();
+    favorites.remove(message);
+    await prefs.setStringList('favorites', favorites);
+    setState(() {});
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text("Favorites")),
-      body: widget.favorites.isEmpty
+      body: favorites.isEmpty
           ? const Center(child: Text("No favorites yet 💔"))
           : ListView.builder(
-        itemCount: widget.favorites.length,
+        itemCount: favorites.length,
         itemBuilder: (context, index) {
-          final msg = widget.favorites[index];
           return ListTile(
-            leading: const Icon(Icons.favorite, color: Colors.red),
-            title: Text(msg),
+            leading: const Icon(Icons.favorite),
+            title: Text(favorites[index]),
             trailing: IconButton(
               icon: const Icon(Icons.delete),
-              onPressed: () {
-                widget.onToggle(msg);
-                setState(() {});
-              },
+              onPressed: () => _removeFavorite(favorites[index]),
             ),
           );
         },
       ),
     );
+  }
+}
+
+class NotificationService {
+  static final NotificationService _instance = NotificationService._internal();
+  factory NotificationService() => _instance;
+  NotificationService._internal();
+
+  final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+  FlutterLocalNotificationsPlugin();
+
+  Future<void> init() async {
+    const AndroidInitializationSettings initializationSettingsAndroid =
+    AndroidInitializationSettings('@mipmap/ic_launcher');
+
+    const InitializationSettings initializationSettings =
+    InitializationSettings(android: initializationSettingsAndroid);
+
+    await flutterLocalNotificationsPlugin.initialize(initializationSettings);
+  }
+
+  void scheduleDailyNotification(List<String> messages) async {
+    if (messages.isEmpty) return;
+
+    final random = Random();
+    final message = messages[random.nextInt(messages.length)];
+
+    await flutterLocalNotificationsPlugin.zonedSchedule(
+      0,
+      'Daily Love Note 💌',
+      message,
+      _nextInstanceOfTime(9, 0), // 9:00 AM daily
+      const NotificationDetails(
+        android: AndroidNotificationDetails(
+          'daily_love_notes_channel',
+          'Daily Love Notes',
+          importance: Importance.max,
+          priority: Priority.high,
+          playSound: true,
+        ),
+      ),
+      androidAllowWhileIdle: true,
+      uiLocalNotificationDateInterpretation:
+      UILocalNotificationDateInterpretation.absoluteTime,
+      matchDateTimeComponents: DateTimeComponents.time,
+    );
+  }
+
+  tz.TZDateTime _nextInstanceOfTime(int hour, int minute) {
+    final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
+    tz.TZDateTime scheduled =
+    tz.TZDateTime(tz.local, now.year, now.month, now.day, hour, minute);
+    if (scheduled.isBefore(now)) {
+      scheduled = scheduled.add(const Duration(days: 1));
+    }
+    return scheduled;
   }
 }
